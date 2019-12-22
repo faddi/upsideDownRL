@@ -12,11 +12,18 @@ from torch.autograd import Variable
 import matplotlib.pyplot as plt
 import pdb
 from collections import deque
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedListWithKey
 import random
 import os
 import time
 import sys
+from typing import NamedTuple, List
+
+class Trajectory(NamedTuple):
+    total_reward: int
+    states: List[np.ndarray]
+    actions: List[np.ndarray]
+    rewards: List[int]
 
 # Behavior func: If an agent is in a given state and desires a given return over a given horizon,
 # which action should it take next?
@@ -43,26 +50,27 @@ class BehaviorFunc(nn.Module):
 
 
 class UpsideDownRL(object):
-    def __init__(self, env, args):
+    def __init__(self, env, args, max_reward = 250):
         super(UpsideDownRL, self).__init__()
         self.env = env
         self.args = args
         self.nb_actions = self.env.action_space.n
         self.state_space = self.env.observation_space.shape[0]
+        # Used to clip rewards so that B does not get unrealistic expected reward inputs.
+        self.max_reward = max_reward
 
         # Use sorted dict to store experiences gathered.
         # This helps in fetching highest reward trajectories during exploratory stage.
-        self.experience = SortedDict()
+        # self.experience = SortedDict()
+        self.experience: SortedListWithKey[Trajectory] = SortedListWithKey([], key=lambda entry: -entry.total_reward)
         self.B = BehaviorFunc(self.state_space, self.nb_actions, args).cuda()
         self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
         self.use_random_actions = True  # True for the first training epoch.
-        self.softmax = nn.Softmax()
-        # Used to clip rewards so that B does not get unrealistic expected reward inputs.
-        self.lunar_lander_max_reward = 250
+        self.softmax = nn.Softmax(dim=1)
 
     # Generate an episode using given command inputs to the B function.
     def gen_episode(self, dr, dh):
-        state = self.env.reset()
+        state = self.env.reset().astype(np.float32)
         episode_data = []
         states = []
         rewards = []
@@ -71,6 +79,7 @@ class UpsideDownRL(object):
         while True:
             action = self.select_action(state, dr, dh)
             next_state, reward, is_terminal, _ = self.env.step(action)
+            next_state = next_state.astype(np.float32)
             if self.args.render:
                 self.env.render()
             states.append(state)
@@ -78,7 +87,7 @@ class UpsideDownRL(object):
             rewards.append(reward)
             total_reward += reward
             state = next_state
-            dr = min(dr - reward, self.lunar_lander_max_reward)
+            dr = min(dr - reward, self.max_reward)
             dh = max(dh - 1, 1)
             if is_terminal:
                 break
@@ -89,11 +98,15 @@ class UpsideDownRL(object):
     # to sample more trajectories using the latest behavior function.
     def fill_replay_buffer(self):
         dr, dh = self.get_desired_return_and_horizon()
-        self.experience.clear()
+        # self.experience.clear()
         for i in range(self.args.replay_buffer_capacity):
             total_reward, states, actions, rewards = self.gen_episode(dr, dh)
-            self.experience.__setitem__(
-                total_reward, (states, actions, rewards))
+            # self.experience.__setitem__(
+            #     total_reward, (states, actions, rewards))
+            self.experience.add(Trajectory(total_reward=total_reward, states=states, actions=actions, rewards=rewards))
+
+        while len(self.experience) > self.args.replay_buffer_capacity:
+            self.experience.pop()
 
         if self.args.verbose:
             if self.use_random_actions:
@@ -126,9 +139,11 @@ class UpsideDownRL(object):
         h = []
         r = []
         for i in range(self.args.explore_buffer_len):
-            episode = self.experience.popitem()  # will return in sorted order
-            h.append(len(episode[1][0]))
-            r.append(episode[0])
+            # episode = self.experience.popitem()  # will return in sorted order
+            episode = self.experience[i]  # will return in sorted order
+            # episode = self.experience.pop(0)  # will return in sorted order
+            h.append(len(episode.actions))
+            r.append(episode.total_reward)
 
         mean_horizon_len = np.mean(h)
         mean_reward = np.random.uniform(
@@ -136,8 +151,10 @@ class UpsideDownRL(object):
         return mean_reward, mean_horizon_len
 
     def trainBehaviorFunc(self):
-        experience_dict = dict(self.experience)
-        experience_values = list(experience_dict.values())
+        # experience_dict = dict(self.experience)
+        # experience_values = list(experience_dict.values())
+        losses = []
+        experience_values = self.experience
         for i in range(self.args.train_iter):
             state = []
             dr = []
@@ -146,13 +163,15 @@ class UpsideDownRL(object):
             indices = np.random.choice(
                 len(experience_values), self.args.batch_size, replace=True)
             train_episodes = [experience_values[i] for i in indices]
-            t1 = [np.random.choice(len(e[0])-2, 1) for e in train_episodes]
+            t1 = [np.random.choice(len(e.states)-2, 1) for e in train_episodes]
 
-            for pair in zip(t1, train_episodes):
-                state.append(pair[1][0][pair[0][0]])
-                dr.append(np.sum(pair[1][2][pair[0][0]:]))
-                dh.append(len(pair[1][0])-pair[0][0])
-                target.append(pair[1][1][pair[0][0]])
+            # for pair in zip(t1, train_episodes):
+            for index_list, trajectory in zip(t1, train_episodes):
+                i = index_list[0]
+                state.append(trajectory.states[i])
+                dr.append(np.sum(trajectory.rewards[i:]))
+                dh.append(len(trajectory.actions)-i)
+                target.append(trajectory.actions[i])
 
             self.optimizer.zero_grad()
             state = torch.from_numpy(np.array(state)).cuda()
@@ -164,8 +183,11 @@ class UpsideDownRL(object):
             action_logits = self.B(state, dr, dh)
             loss = nn.CrossEntropyLoss()
             output = loss(action_logits, target).mean()
+            losses.append(output.item())
             output.backward()
             self.optimizer.step()
+
+        print(f"loss {np.mean(losses)}")
 
     # Evaluate the agent using the initial command input from the best topK performing trajectories.
     def evaluate(self):
@@ -186,6 +208,7 @@ class UpsideDownRL(object):
         iterations = 0
         test_returns = []
         while True:
+            self.evaluate()
             # Train behavior function with trajectories stored in the replay buffer.
             self.trainBehaviorFunc()
             self.fill_replay_buffer()
@@ -204,16 +227,16 @@ def main():
         description="Hyperparameters for UpsideDown RL")
     parser.add_argument("--render", action='store_true')
     parser.add_argument("--verbose", action='store_true')
-    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--command_scale", type=float, default=0.01)
-    parser.add_argument("--replay_buffer_capacity", type=int, default=500)
+    parser.add_argument("--replay_buffer_capacity", type=int, default=100)
     parser.add_argument("--explore_buffer_len", type=int, default=10)
     parser.add_argument("--eval_every_k_epoch", type=int, default=5)
     parser.add_argument("--evaluate_trials", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--train_iter", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--train_iter", type=int, default=200)
     parser.add_argument("--save_path", type=str, default="DefaultParams/")
     parser.add_argument("--do_save", default=False, action='store_true')
 
@@ -224,7 +247,8 @@ def main():
       else:
           sys.exit("Directory already exists.")
 
-    env = gym.make("LunarLander-v2")
+    # env = gym.make("LunarLander-v2")
+    env = gym.make("CartPole-v1")
     env.seed(args.seed)
     torch.manual_seed(args.seed)
     agent = UpsideDownRL(env, args)
