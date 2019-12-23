@@ -19,6 +19,8 @@ import time
 import sys
 from typing import NamedTuple, List
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 class Trajectory(NamedTuple):
     total_reward: int
     states: List[np.ndarray]
@@ -63,7 +65,7 @@ class UpsideDownRL(object):
         # This helps in fetching highest reward trajectories during exploratory stage.
         # self.experience = SortedDict()
         self.experience: SortedListWithKey[Trajectory] = SortedListWithKey([], key=lambda entry: -entry.total_reward)
-        self.B = BehaviorFunc(self.state_space, self.nb_actions, args).cuda()
+        self.B = BehaviorFunc(self.state_space, self.nb_actions, args).to(device)
         self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
         self.use_random_actions = True  # True for the first training epoch.
         self.softmax = nn.Softmax(dim=1)
@@ -119,11 +121,11 @@ class UpsideDownRL(object):
         if self.use_random_actions:
             action = np.random.randint(self.nb_actions)
         else:
-            action_prob = self.B(torch.from_numpy(state).cuda(),
+            action_prob = self.B(torch.from_numpy(state).to(device),
                                  torch.from_numpy(
-                                     np.array(desired_return, dtype=np.float32)).reshape(-1, 1).cuda(),
+                                     np.array(desired_return, dtype=np.float32)).reshape(-1, 1).to(device),
                                  torch.from_numpy(
-                                     np.array(desired_horizon, dtype=np.float32).reshape(-1, 1)).cuda()
+                                     np.array(desired_horizon, dtype=np.float32).reshape(-1, 1)).to(device)
                                  )
             action_prob = self.softmax(action_prob)
             # create a categorical distribution over action probabilities
@@ -174,12 +176,12 @@ class UpsideDownRL(object):
                 target.append(trajectory.actions[i])
 
             self.optimizer.zero_grad()
-            state = torch.from_numpy(np.array(state)).cuda()
+            state = torch.from_numpy(np.array(state)).to(device)
             dr = torch.from_numpy(
-                np.array(dr, dtype=np.float32).reshape(-1, 1)).cuda()
+                np.array(dr, dtype=np.float32).reshape(-1, 1)).to(device)
             dh = torch.from_numpy(
-                np.array(dh, dtype=np.float32).reshape(-1, 1)).cuda()
-            target = torch.from_numpy(np.array(target)).long().cuda()
+                np.array(dh, dtype=np.float32).reshape(-1, 1)).to(device)
+            target = torch.from_numpy(np.array(target)).long().to(device)
             action_logits = self.B(state, dr, dh)
             loss = nn.CrossEntropyLoss()
             output = loss(action_logits, target).mean()
@@ -227,12 +229,12 @@ def main():
         description="Hyperparameters for UpsideDown RL")
     parser.add_argument("--render", action='store_true')
     parser.add_argument("--verbose", action='store_true')
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--command_scale", type=float, default=0.01)
-    parser.add_argument("--replay_buffer_capacity", type=int, default=100)
-    parser.add_argument("--explore_buffer_len", type=int, default=10)
+    parser.add_argument("--replay_buffer_capacity", type=int, default=300)
+    parser.add_argument("--explore_buffer_len", type=int, default=20)
     parser.add_argument("--eval_every_k_epoch", type=int, default=5)
     parser.add_argument("--evaluate_trials", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=512)
@@ -247,8 +249,8 @@ def main():
       else:
           sys.exit("Directory already exists.")
 
-    # env = gym.make("LunarLander-v2")
-    env = gym.make("CartPole-v1")
+    env = gym.make("LunarLander-v2")
+    # env = gym.make("CartPole-v1")
     env.seed(args.seed)
     torch.manual_seed(args.seed)
     agent = UpsideDownRL(env, args)
