@@ -27,6 +27,27 @@ class Trajectory(NamedTuple):
     actions: List[np.ndarray]
     rewards: List[int]
 
+class DelayRewardsWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.env = env
+        self._total_reward = 0.0
+
+    def step(self, action):
+        next_state, reward, done, info = self.env.step(action)
+        self._total_reward += reward
+        # modify ...
+        r = 0
+        if done:
+          r = self._total_reward
+          self._total_reward = 0.0
+        return next_state, r, done, info
+
+    def reset(self, *args):
+        self._total_reward = 0.0
+        return self.env.reset(*args)
+
+
 # Behavior func: If an agent is in a given state and desires a given return over a given horizon,
 # which action should it take next?
 # Input state s_t and command c_t=(dr_t, dh_t)
@@ -68,7 +89,6 @@ class UpsideDownRL(object):
         self.B = BehaviorFunc(self.state_space, self.nb_actions, args).to(device)
         self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
         self.use_random_actions = True  # True for the first training epoch.
-        self.softmax = nn.Softmax(dim=1)
 
     # Generate an episode using given command inputs to the B function.
     def gen_episode(self, dr, dh):
@@ -107,8 +127,8 @@ class UpsideDownRL(object):
             #     total_reward, (states, actions, rewards))
             self.experience.add(Trajectory(total_reward=total_reward, states=states, actions=actions, rewards=rewards))
 
-        while len(self.experience) > self.args.replay_buffer_capacity:
-            self.experience.pop()
+            if len(self.experience) > self.args.replay_buffer_capacity:
+                self.experience.pop()
 
         if self.args.verbose:
             if self.use_random_actions:
@@ -127,7 +147,7 @@ class UpsideDownRL(object):
                                  torch.from_numpy(
                                      np.array(desired_horizon, dtype=np.float32).reshape(-1, 1)).to(device)
                                  )
-            action_prob = self.softmax(action_prob)
+            action_prob = F.softmax(action_prob, dim=1)
             # create a categorical distribution over action probabilities
             dist = Categorical(action_prob)
             action = dist.sample().item()
@@ -162,8 +182,7 @@ class UpsideDownRL(object):
             dr = []
             dh = []
             target = []
-            indices = np.random.choice(
-                len(experience_values), self.args.batch_size, replace=True)
+            indices = np.random.choice(len(experience_values), self.args.batch_size, replace=True)
             train_episodes = [experience_values[i] for i in indices]
             t1 = [np.random.choice(len(e.states)-2, 1) for e in train_episodes]
 
@@ -251,6 +270,7 @@ def main():
 
     env = gym.make("LunarLander-v2")
     # env = gym.make("CartPole-v1")
+    env = DelayRewardsWrapper(env)
     env.seed(args.seed)
     torch.manual_seed(args.seed)
     agent = UpsideDownRL(env, args)
