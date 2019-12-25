@@ -19,6 +19,10 @@ import time
 import sys
 from typing import NamedTuple, List
 
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class Trajectory(NamedTuple):
@@ -37,9 +41,10 @@ class DelayRewardsWrapper(gym.Wrapper):
         next_state, reward, done, info = self.env.step(action)
         self._total_reward += reward
         # modify ...
+        # r = reward
         r = 0
         if done:
-          r = self._total_reward
+          r += self._total_reward
           self._total_reward = 0.0
         return next_state, r, done, info
 
@@ -81,17 +86,19 @@ class UpsideDownRL(object):
         self.state_space = self.env.observation_space.shape[0]
         # Used to clip rewards so that B does not get unrealistic expected reward inputs.
         self.max_reward = max_reward
+        self.episode_counter = 0
 
         # Use sorted dict to store experiences gathered.
         # This helps in fetching highest reward trajectories during exploratory stage.
         # self.experience = SortedDict()
-        self.experience: SortedListWithKey[Trajectory] = SortedListWithKey([], key=lambda entry: -entry.total_reward)
+        self.experience: SortedListWithKey = SortedListWithKey([], key=lambda entry: -entry.total_reward)
         self.B = BehaviorFunc(self.state_space, self.nb_actions, args).to(device)
         self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
         self.use_random_actions = True  # True for the first training epoch.
 
     # Generate an episode using given command inputs to the B function.
     def gen_episode(self, dr, dh):
+        self.episode_counter += 1
         state = self.env.reset().astype(np.float32)
         episode_data = []
         states = []
@@ -118,14 +125,18 @@ class UpsideDownRL(object):
 
     # Fetch the desired return and horizon from the best trajectories in the current replay buffer
     # to sample more trajectories using the latest behavior function.
-    def fill_replay_buffer(self):
-        dr, dh = self.get_desired_return_and_horizon()
+    def fill_replay_buffer(self, fill_full=False):
+        all_rewards = []
+        dr, dh = self.get_desired_return_and_horizon(print_means=True)
+
+        writer.add_scalar('Train/DesiredReturn', dr, self.episode_counter)
+        writer.add_scalar('Train/DesiredHorizon', dh, self.episode_counter)
         # self.experience.clear()
-        for i in range(self.args.replay_buffer_capacity):
+        count = self.args.replay_buffer_capacity if fill_full else self.args.episodes_per_iter
+        for i in range(count):
             total_reward, states, actions, rewards = self.gen_episode(dr, dh)
-            # self.experience.__setitem__(
-            #     total_reward, (states, actions, rewards))
             self.experience.add(Trajectory(total_reward=total_reward, states=states, actions=actions, rewards=rewards))
+            all_rewards.append(total_reward)
 
             if len(self.experience) > self.args.replay_buffer_capacity:
                 self.experience.pop()
@@ -136,6 +147,9 @@ class UpsideDownRL(object):
             else:
                 print("Filled replay buffer using BehaviorFunc")
         self.use_random_actions = False
+
+        writer.add_scalar('Train/FillMeanTotalReward', np.mean(all_rewards), self.episode_counter)
+
 
     def select_action(self, state, desired_return=None, desired_horizon=None):
         if self.use_random_actions:
@@ -153,14 +167,13 @@ class UpsideDownRL(object):
             action = dist.sample().item()
         return action
 
-    # Todo: don't popitem from the experience buffer since these best-performing trajectories can have huge impact on learning of B
-    def get_desired_return_and_horizon(self):
+    def get_desired_return_and_horizon(self, print_means=False):
         if (self.use_random_actions):
             return 0, 0
 
         h = []
         r = []
-        for i in range(self.args.explore_buffer_len):
+        for i in range(min(self.args.explore_buffer_len, len(self.experience))):
             # episode = self.experience.popitem()  # will return in sorted order
             episode = self.experience[i]  # will return in sorted order
             # episode = self.experience.pop(0)  # will return in sorted order
@@ -209,23 +222,25 @@ class UpsideDownRL(object):
             self.optimizer.step()
 
         print(f"loss {np.mean(losses)}")
+        writer.add_scalar('Train/Loss', np.mean(losses), self.episode_counter)
 
     # Evaluate the agent using the initial command input from the best topK performing trajectories.
     def evaluate(self):
         testing_rewards = []
         testing_steps = []
-        dr, dh = self.get_desired_return_and_horizon()
+        dr, dh = self.get_desired_return_and_horizon(print_means=False)
         for i in range(self.args.evaluate_trials):
             total_reward, states, actions, rewards = self.gen_episode(dr, dh)
             testing_rewards.append(total_reward)
             testing_steps.append(len(rewards))
 
         print("Mean reward achieved : {}".format(np.mean(testing_rewards)))
+        writer.add_scalar('Train/MeanReward', np.mean(testing_rewards), self.episode_counter)
         return np.mean(testing_rewards)
 
     def train(self):
         # Fill replay buffer with random actions for the first time.
-        self.fill_replay_buffer()
+        self.fill_replay_buffer(fill_full=True)
         iterations = 0
         test_returns = []
         while True:
@@ -250,16 +265,19 @@ def main():
     parser.add_argument("--verbose", action='store_true')
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--command_scale", type=float, default=0.01)
+    parser.add_argument("--episodes_per_iter", type=int, default=20)
     parser.add_argument("--replay_buffer_capacity", type=int, default=300)
-    parser.add_argument("--explore_buffer_len", type=int, default=20)
+    parser.add_argument("--explore_buffer_len", type=int, default=20) # decides exploration pase, lower values -> more aggressive
     parser.add_argument("--eval_every_k_epoch", type=int, default=5)
     parser.add_argument("--evaluate_trials", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--train_iter", type=int, default=200)
+    parser.add_argument("--train_iter", type=int, default=400)
     parser.add_argument("--save_path", type=str, default="DefaultParams/")
     parser.add_argument("--do_save", default=False, action='store_true')
+    parser.add_argument("--env_name", type=str, default='LunarLander-v2')
+    # parser.add_argument("--env_name", type=str, default='CartPole-v1')
 
     args = parser.parse_args()
     if args.do_save:
@@ -268,7 +286,8 @@ def main():
       else:
           sys.exit("Directory already exists.")
 
-    env = gym.make("LunarLander-v2")
+    writer.add_hparams(hparam_dict=vars(args), metric_dict=dict())
+    env = gym.make(args.env_name)
     # env = gym.make("CartPole-v1")
     env = DelayRewardsWrapper(env)
     env.seed(args.seed)
