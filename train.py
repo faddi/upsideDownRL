@@ -19,6 +19,7 @@ import time
 import sys
 from typing import NamedTuple, List
 from torch.autograd import Variable
+import json
 
 
 from torch.utils.tensorboard import SummaryWriter
@@ -79,9 +80,9 @@ class BehaviorFunc(nn.Module):
         y = torch.relu(self.fc2(concat_command))
         x = x * y
 
-        x = x.view(state.size(0), 1, -1)
-        x, (hidden_state, cell_state) = self.lstm(x, (hidden_state, cell_state))
-        x = x.view(state.size(0), -1)
+        # x = x.view(state.size(0), 1, -1)
+        # x, (hidden_state, cell_state) = self.lstm(x, (hidden_state, cell_state))
+        # x = x.view(state.size(0), -1)
 
         return self.fc3(x), hidden_state, cell_state
 
@@ -114,7 +115,7 @@ class UpsideDownRL(object):
         self.experience: SortedListWithKey = SortedListWithKey([], key=lambda entry: -entry.total_reward)
         self.B = BehaviorFunc(self.state_space, self.nb_actions, args).to(device)
         self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
-        # self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=10, verbose=True, mode='min', threshold=1e-10)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=500, verbose=True, mode='min', threshold_mode='abs', threshold=1e-10)
         # self.optimizer = optim.Adadelta(self.B.parameters())
         self.use_random_actions = True  # True for the first training epoch.
 
@@ -151,19 +152,24 @@ class UpsideDownRL(object):
     # to sample more trajectories using the latest behavior function.
     def fill_replay_buffer(self, fill_full=False):
         all_rewards = []
-        dr, dh = self.get_desired_return_and_horizon(print_means=True)
 
-        writer.add_scalar('Train/DesiredReturn', dr, self.episode_counter)
-        writer.add_scalar('Train/DesiredHorizon', dh, self.episode_counter)
+        all_dr = []
+        all_dh = []
+        if len(self.experience) == self.args.replay_buffer_capacity:
+            for i in range(self.args.episodes_per_iter):
+                if len(self.experience) > 0:
+                    self.experience.pop()
+
         # self.experience.clear()
         count = self.args.replay_buffer_capacity if fill_full else self.args.episodes_per_iter
-        for i in range(count):
+        while len(self.experience) < self.args.replay_buffer_capacity:
+            dr, dh = self.get_desired_return_and_horizon(print_means=True)
+            all_dr.append(dr)
+            all_dh.append(dh)
             total_reward, states, actions, rewards = self.gen_episode(dr, dh)
             self.experience.add(Trajectory(total_reward=total_reward, states=states, actions=actions, rewards=rewards))
             all_rewards.append(total_reward)
 
-            if len(self.experience) > self.args.replay_buffer_capacity:
-                self.experience.pop()
 
         if self.args.verbose:
             if self.use_random_actions:
@@ -172,6 +178,8 @@ class UpsideDownRL(object):
                 print("Filled replay buffer using BehaviorFunc")
         self.use_random_actions = False
 
+        writer.add_scalar('Train/DesiredReturn', np.mean(all_dr), self.episode_counter)
+        writer.add_scalar('Train/DesiredHorizon', np.mean(all_dh), self.episode_counter)
         writer.add_scalar('Train/FillMeanTotalReward', np.mean(all_rewards), self.episode_counter)
 
 
@@ -196,16 +204,22 @@ class UpsideDownRL(object):
 
         h = []
         r = []
-        for i in range(min(self.args.explore_buffer_len, len(self.experience))):
-            # episode = self.experience.popitem()  # will return in sorted order
-            episode = self.experience[i]  # will return in sorted order
-            # episode = self.experience.pop(0)  # will return in sorted order
+        # for i in range(min(self.args.explore_buffer_len, len(self.experience))):
+        #     # episode = self.experience.popitem()  # will return in sorted order
+        #     episode = self.experience[i]  # will return in sorted order
+        #     # episode = self.experience.pop(0)  # will return in sorted order
+        #     h.append(len(episode.actions))
+        #     r.append(episode.total_reward)
+
+        episode_indexes = np.random.choice(len(self.experience), size=min(self.args.explore_buffer_len, len(self.experience)), replace=False)
+        for index in episode_indexes:
+            episode = self.experience[index]
             h.append(len(episode.actions))
             r.append(episode.total_reward)
 
         mean_horizon_len = np.mean(h)
-        mean_reward = np.random.uniform(
-            low=np.mean(r), high=np.mean(r)+np.std(r))
+        mean_reward = np.random.uniform(low=np.mean(r), high=np.mean(r)+np.std(r))
+        # mean_reward = np.random.uniform(low=np.mean(r), high=np.max(r) * 1.05)
         return mean_reward, mean_horizon_len
 
     def trainBehaviorFunc(self):
@@ -249,7 +263,7 @@ class UpsideDownRL(object):
         print(f"loss {np.mean(losses)}")
         writer.add_scalar('Train/Loss', np.mean(losses), self.episode_counter)
         self.train_counter += 1
-        # self.scheduler.step(self.train_counter)
+        self.scheduler.step(self.train_counter)
 
     # Evaluate the agent using the initial command input from the best topK performing trajectories.
     def evaluate(self):
@@ -290,19 +304,19 @@ def main():
         description="Hyperparameters for UpsideDown RL")
     parser.add_argument("--render", action='store_true')
     parser.add_argument("--verbose", action='store_true')
-    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--lr", type=float, default=1.0e-2)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--hidden_size", type=int, default=256)
+    parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--command_scale", type=float, default=0.01)
-    parser.add_argument("--episodes_per_iter", type=int, default=20)
+    parser.add_argument("--episodes_per_iter", type=int, default=250)
     parser.add_argument("--replay_buffer_capacity", type=int, default=500)
-    parser.add_argument("--explore_buffer_len", type=int, default=20) # decides exploration pase, lower values -> more aggressive
+    parser.add_argument("--explore_buffer_len", type=int, default=10) # decides exploration pase, lower values -> more aggressive
     parser.add_argument("--eval_every_k_epoch", type=int, default=5)
     parser.add_argument("--evaluate_trials", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--train_iter", type=int, default=200)
-    parser.add_argument("--save_path", type=str, default="DefaultParams/")
-    parser.add_argument("--do_save", default=False, action='store_true')
+    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--train_iter", type=int, default=100)
+    parser.add_argument("--save_path", type=str, default="./models/")
+    parser.add_argument("--do_save", default=True, action='store_true')
     parser.add_argument("--env_name", type=str, default='LunarLander-v2')
     # parser.add_argument("--env_name", type=str, default='CartPole-v0')
 
@@ -310,8 +324,8 @@ def main():
     if args.do_save:
       if not os.path.exists(args.save_path):
           os.mkdir(args.save_path)
-      else:
-          sys.exit("Directory already exists.")
+      # else:
+      #     sys.exit("Directory already exists.")
 
     writer.add_hparams(hparam_dict=vars(args), metric_dict=dict())
     env = gym.make(args.env_name)
