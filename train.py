@@ -33,6 +33,7 @@ class Trajectory(NamedTuple):
     states: List[np.ndarray]
     actions: List[np.ndarray]
     rewards: List[int]
+    prev_actions_logits: List[np.ndarray]
 
 class DelayRewardsWrapper(gym.Wrapper):
     def __init__(self, env):
@@ -44,8 +45,8 @@ class DelayRewardsWrapper(gym.Wrapper):
         next_state, reward, done, info = self.env.step(action)
         self._total_reward += reward
         # modify ...
-        # r = reward
-        r = 0
+        r = reward
+        # r = 0
         if done:
           r += self._total_reward
           self._total_reward = 0.0
@@ -65,30 +66,37 @@ class DelayRewardsWrapper(gym.Wrapper):
 class BehaviorFunc(nn.Module):
     def __init__(self, state_size, action_size, args):
         super(BehaviorFunc, self).__init__()
+        self.action_size = action_size
         self.args = args
-        self.fc1 = nn.Linear(state_size, self.args.hidden_size)
-        self.fc2 = nn.Linear(2, self.args.hidden_size)
+        self.fc1 = nn.Linear(state_size + 2 + action_size, self.args.hidden_size)
+        # self.fc2 = nn.Linear(2, self.args.hidden_size)
 
-        self.lstm = nn.LSTM(self.args.hidden_size, self.args.hidden_size)
+        # self.lstm = nn.LSTM(self.args.hidden_size, self.args.hidden_size, num_layers=2)
 
         self.fc3 = nn.Linear(self.args.hidden_size, action_size)
         self.command_scale = args.command_scale
 
-    def forward(self, state, desired_return, desired_horizon, hidden_state, cell_state):
-        x = torch.relu(self.fc1(state))
-        concat_command = torch.cat((desired_return, desired_horizon), 1)*self.command_scale
-        y = torch.relu(self.fc2(concat_command))
-        x = x * y
+    def forward(self, state, prev_action, desired_return, desired_horizon, hidden_state, cell_state):
+
+        cmd = torch.cat((desired_return, desired_horizon, prev_action), 1) * self.command_scale
+        # cmd = cmd.repeat(B)
+        
+        x = torch.cat((state, cmd), 1)
+
+        x = torch.relu(self.fc1(x))
+        # concat_command = torch.cat((desired_return, desired_horizon), 1)*self.command_scale
+        # y = torch.relu(self.fc2(concat_command))
+        # x = x * y
 
         # x = x.view(state.size(0), 1, -1)
         # x, (hidden_state, cell_state) = self.lstm(x, (hidden_state, cell_state))
         # x = x.view(state.size(0), -1)
 
         return self.fc3(x), hidden_state, cell_state
-
+    
     def init_states(self):
-        hidden_state = torch.zeros(1, 1, self.args.hidden_size).to(device)
-        cell_state = torch.zeros(1, 1, self.args.hidden_size).to(device)
+        hidden_state = torch.zeros(2, 1, self.args.hidden_size).to(device)
+        cell_state = torch.zeros(2, 1, self.args.hidden_size).to(device)
         return hidden_state, cell_state
 
     def reset_states(self, hidden_state, cell_state):
@@ -126,18 +134,22 @@ class UpsideDownRL(object):
         self.episode_counter += 1
         state = self.env.reset().astype(np.float32)
         self.hidden_state, self.cell_state = self.B.reset_states(self.hidden_state, self.cell_state)
+        prev_action_logits = np.zeros(self.B.action_size)
         states = []
         rewards = []
         actions = []
+        action_logits = []
         total_reward = 0
         while True:
-            action = self.select_action(state, dr, dh)
+            action, current_action_logits = self.select_action(state, prev_action_logits, dr, dh)
             next_state, reward, is_terminal, _ = self.env.step(action)
             next_state = next_state.astype(np.float32)
             if self.args.render:
                 self.env.render()
             states.append(state)
             actions.append(action)
+            action_logits.append(prev_action_logits)
+            prev_action_logits = current_action_logits
             rewards.append(reward)
             total_reward += reward
             state = next_state
@@ -146,7 +158,7 @@ class UpsideDownRL(object):
             if is_terminal:
                 break
 
-        return total_reward, states, actions, rewards
+        return total_reward, states, actions, rewards, action_logits
 
     # Fetch the desired return and horizon from the best trajectories in the current replay buffer
     # to sample more trajectories using the latest behavior function.
@@ -162,12 +174,13 @@ class UpsideDownRL(object):
 
         # self.experience.clear()
         count = self.args.replay_buffer_capacity if fill_full else self.args.episodes_per_iter
+        dr, dh = self.get_desired_return_and_horizon(print_means=True)
         while len(self.experience) < self.args.replay_buffer_capacity:
-            dr, dh = self.get_desired_return_and_horizon(print_means=True)
+            # dr, dh = self.get_desired_return_and_horizon(print_means=True)
             all_dr.append(dr)
             all_dh.append(dh)
-            total_reward, states, actions, rewards = self.gen_episode(dr, dh)
-            self.experience.add(Trajectory(total_reward=total_reward, states=states, actions=actions, rewards=rewards))
+            total_reward, states, actions, rewards, prev_actions_logits = self.gen_episode(dr, dh)
+            self.experience.add(Trajectory(total_reward=total_reward, states=states, actions=actions, rewards=rewards, prev_actions_logits=prev_actions_logits))
             all_rewards.append(total_reward)
 
 
@@ -183,20 +196,23 @@ class UpsideDownRL(object):
         writer.add_scalar('Train/FillMeanTotalReward', np.mean(all_rewards), self.episode_counter)
 
 
-    def select_action(self, state, desired_return=None, desired_horizon=None):
+    def select_action(self, state, prev_action, desired_return=None, desired_horizon=None):
         if self.use_random_actions:
             action = np.random.randint(self.nb_actions)
+            action_prob = np.zeros(self.B.action_size, dtype=np.float32)
         else:
             state = torch.from_numpy(state).to(device)
             dr = torch.from_numpy( np.array(desired_return, dtype=np.float32)).reshape(-1, 1).to(device)
             dh = torch.from_numpy( np.array(desired_horizon, dtype=np.float32).reshape(-1, 1)).to(device)
-            action_prob, self.hidden_state, self.cell_state = self.B(state.unsqueeze(0), dr, dh, self.hidden_state, self.cell_state)
+            prev_action = torch.tensor(np.array(prev_action, dtype=np.float32)).reshape(-1, self.B.action_size).to(device)
+            action_prob_logits, self.hidden_state, self.cell_state = self.B(state.unsqueeze(0), prev_action, dr, dh, self.hidden_state, self.cell_state)
 
-            action_prob = F.softmax(action_prob, dim=1)
+            action_prob = F.softmax(action_prob_logits, dim=1)
             # create a categorical distribution over action probabilities
             dist = Categorical(action_prob)
             action = dist.sample().item()
-        return action
+            action_prob = action_prob.detach().cpu().numpy()[0]
+        return action, action_prob
 
     def get_desired_return_and_horizon(self, print_means=False):
         if (self.use_random_actions):
@@ -233,6 +249,7 @@ class UpsideDownRL(object):
             dr = []
             dh = []
             target = []
+            prev_actions_logits = []
             indices = np.random.choice(len(experience_values), self.args.batch_size, replace=True)
             train_episodes = [experience_values[i] for i in indices]
             t1 = [np.random.choice(len(e.states)-2, 1) for e in train_episodes]
@@ -244,15 +261,15 @@ class UpsideDownRL(object):
                 dr.append(np.sum(trajectory.rewards[i:]))
                 dh.append(len(trajectory.actions)-i)
                 target.append(trajectory.actions[i])
+                prev_actions_logits.append(trajectory.prev_actions_logits[i])
 
             self.optimizer.zero_grad()
             state = torch.from_numpy(np.array(state)).to(device)
-            dr = torch.from_numpy(
-                np.array(dr, dtype=np.float32).reshape(-1, 1)).to(device)
-            dh = torch.from_numpy(
-                np.array(dh, dtype=np.float32).reshape(-1, 1)).to(device)
+            dr = torch.from_numpy(np.array(dr, dtype=np.float32).reshape(-1, 1)).to(device)
+            dh = torch.from_numpy(np.array(dh, dtype=np.float32).reshape(-1, 1)).to(device)
+            prev_actions_logits = torch.from_numpy(np.array(prev_actions_logits, dtype=np.float32).reshape(-1, self.B.action_size)).to(device)
             target = torch.from_numpy(np.array(target)).long().to(device)
-            action_logits, _, _ = self.B(state, dr, dh, self.hidden_state, self.cell_state)
+            action_logits, _, _ = self.B(state, prev_actions_logits, dr, dh, self.hidden_state, self.cell_state)
             loss = nn.CrossEntropyLoss()
             output = loss(action_logits, target).mean()
             losses.append(output.item())
@@ -271,7 +288,7 @@ class UpsideDownRL(object):
         testing_steps = []
         dr, dh = self.get_desired_return_and_horizon(print_means=False)
         for i in range(self.args.evaluate_trials):
-            total_reward, states, actions, rewards = self.gen_episode(dr, dh)
+            total_reward, states, actions, rewards, prev_action_logits = self.gen_episode(dr, dh)
             testing_rewards.append(total_reward)
             testing_steps.append(len(rewards))
 
@@ -291,6 +308,7 @@ class UpsideDownRL(object):
             self.fill_replay_buffer()
 
             if iterations % self.args.eval_every_k_epoch == 0 and self.args.do_save:
+                print("save")
                 test_returns.append(self.evaluate())
                 torch.save(self.B.state_dict(), os.path.join(
                     self.args.save_path, "model.pkl"))
@@ -308,8 +326,8 @@ def main():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--command_scale", type=float, default=0.01)
-    parser.add_argument("--episodes_per_iter", type=int, default=250)
-    parser.add_argument("--replay_buffer_capacity", type=int, default=500)
+    parser.add_argument("--episodes_per_iter", type=int, default=80)
+    parser.add_argument("--replay_buffer_capacity", type=int, default=100)
     parser.add_argument("--explore_buffer_len", type=int, default=10) # decides exploration pase, lower values -> more aggressive
     parser.add_argument("--eval_every_k_epoch", type=int, default=5)
     parser.add_argument("--evaluate_trials", type=int, default=20)
@@ -333,7 +351,7 @@ def main():
     env = DelayRewardsWrapper(env)
     env.seed(args.seed)
     torch.manual_seed(args.seed)
-    agent = UpsideDownRL(env, args)
+    agent = UpsideDownRL(env, args, max_reward=400)
     agent.train()
     env.close()
 
