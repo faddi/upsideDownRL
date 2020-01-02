@@ -69,7 +69,7 @@ class BehaviorFunc(nn.Module):
         self.action_size = action_size
         self.args = args
         self.fc1 = nn.Linear(state_size + 2 + action_size, self.args.hidden_size)
-        # self.fc2 = nn.Linear(2, self.args.hidden_size)
+        self.fc2 = nn.Linear(self.args.hidden_size, self.args.hidden_size)
 
         # self.lstm = nn.LSTM(self.args.hidden_size, self.args.hidden_size, num_layers=2)
 
@@ -78,12 +78,13 @@ class BehaviorFunc(nn.Module):
 
     def forward(self, state, prev_action, desired_return, desired_horizon, hidden_state, cell_state):
 
-        cmd = torch.cat((desired_return, desired_horizon, prev_action), 1) * self.command_scale
+        cmd = torch.cat((desired_return * self.command_scale, desired_horizon * self.command_scale, prev_action), 1)
         # cmd = cmd.repeat(B)
         
         x = torch.cat((state, cmd), 1)
 
         x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
         # concat_command = torch.cat((desired_return, desired_horizon), 1)*self.command_scale
         # y = torch.relu(self.fc2(concat_command))
         # x = x * y
@@ -116,13 +117,16 @@ class UpsideDownRL(object):
         self.max_reward = max_reward
         self.episode_counter = 0
         self.train_counter = 0
+        self.episode_counter = 0
+        self.step_counter = 0
 
         # Use sorted dict to store experiences gathered.
         # This helps in fetching highest reward trajectories during exploratory stage.
         # self.experience = SortedDict()
         self.experience: SortedListWithKey = SortedListWithKey([], key=lambda entry: -entry.total_reward)
         self.B = BehaviorFunc(self.state_space, self.nb_actions, args).to(device)
-        self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
+        # self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
+        self.optimizer = optim.RMSprop(self.B.parameters())
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=500, verbose=True, mode='min', threshold_mode='abs', threshold=1e-10)
         # self.optimizer = optim.Adadelta(self.B.parameters())
         self.use_random_actions = True  # True for the first training epoch.
@@ -155,6 +159,7 @@ class UpsideDownRL(object):
             state = next_state
             dr = min(dr - reward, self.max_reward)
             dh = max(dh - 1, 1)
+            self.step_counter += 1
             if is_terminal:
                 break
 
@@ -162,19 +167,17 @@ class UpsideDownRL(object):
 
     # Fetch the desired return and horizon from the best trajectories in the current replay buffer
     # to sample more trajectories using the latest behavior function.
-    def fill_replay_buffer(self, fill_full=False):
+    def fill_replay_buffer(self):
         all_rewards = []
-
         all_dr = []
         all_dh = []
+        dr, dh = self.get_desired_return_and_horizon(print_means=True)
+
         if len(self.experience) == self.args.replay_buffer_capacity:
             for i in range(self.args.episodes_per_iter):
                 if len(self.experience) > 0:
                     self.experience.pop()
 
-        # self.experience.clear()
-        count = self.args.replay_buffer_capacity if fill_full else self.args.episodes_per_iter
-        dr, dh = self.get_desired_return_and_horizon(print_means=True)
         while len(self.experience) < self.args.replay_buffer_capacity:
             # dr, dh = self.get_desired_return_and_horizon(print_means=True)
             all_dr.append(dr)
@@ -227,11 +230,25 @@ class UpsideDownRL(object):
         #     h.append(len(episode.actions))
         #     r.append(episode.total_reward)
 
-        episode_indexes = np.random.choice(len(self.experience), size=min(self.args.explore_buffer_len, len(self.experience)), replace=False)
-        for index in episode_indexes:
-            episode = self.experience[index]
+        for i in range(min(self.args.explore_buffer_len, len(self.experience))):
+            # episode = self.experience.popitem()  # will return in sorted order
+            episode = self.experience[-(i + 1)]  # will return in sorted order
+            # episode = self.experience.pop(0)  # will return in sorted order
             h.append(len(episode.actions))
             r.append(episode.total_reward)
+
+        # for i in range(len(self.experience)):
+        #     # episode = self.experience.popitem()  # will return in sorted order
+        #     episode = self.experience[-(i + 1)]  # will return in sorted order
+        #     # episode = self.experience.pop(0)  # will return in sorted order
+        #     h.append(len(episode.actions))
+        #     r.append(episode.total_reward)
+
+        # episode_indexes = np.random.choice(len(self.experience), size=min(self.args.explore_buffer_len, len(self.experience)), replace=False)
+        # for index in episode_indexes:
+        #     episode = self.experience[index]
+        #     h.append(len(episode.actions))
+        #     r.append(episode.total_reward)
 
         mean_horizon_len = np.mean(h)
         mean_reward = np.random.uniform(low=np.mean(r), high=np.mean(r)+np.std(r))
@@ -298,7 +315,7 @@ class UpsideDownRL(object):
 
     def train(self):
         # Fill replay buffer with random actions for the first time.
-        self.fill_replay_buffer(fill_full=True)
+        self.fill_replay_buffer()
         iterations = 0
         test_returns = []
         while True:
@@ -315,6 +332,9 @@ class UpsideDownRL(object):
                 np.save(os.path.join(self.args.save_path,
                                      "testing_rewards"), test_returns)
             iterations += 1
+            writer.add_scalar('Train/iterations', iterations , self.episode_counter)
+            writer.add_scalar('Train/episodes', self.episode_counter , self.episode_counter)
+            writer.add_scalar('Train/steps', self.step_counter, self.episode_counter)
 
 
 def main():
@@ -326,12 +346,12 @@ def main():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--command_scale", type=float, default=0.01)
-    parser.add_argument("--episodes_per_iter", type=int, default=80)
-    parser.add_argument("--replay_buffer_capacity", type=int, default=100)
-    parser.add_argument("--explore_buffer_len", type=int, default=10) # decides exploration pase, lower values -> more aggressive
-    parser.add_argument("--eval_every_k_epoch", type=int, default=5)
+    parser.add_argument("--episodes_per_iter", type=int, default=30)
+    parser.add_argument("--replay_buffer_capacity", type=int, default=500)
+    parser.add_argument("--explore_buffer_len", type=int, default=30) # decides exploration pase, lower values -> more aggressive
+    parser.add_argument("--eval_every_k_epoch", type=int, default=10)
     parser.add_argument("--evaluate_trials", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--train_iter", type=int, default=100)
     parser.add_argument("--save_path", type=str, default="./models/")
     parser.add_argument("--do_save", default=True, action='store_true')
